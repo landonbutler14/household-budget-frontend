@@ -76,6 +76,25 @@
   select { width: 100%; }
   .center { text-align: center; }
   a.link { color: var(--accent); }
+  .cat-header { cursor: pointer; user-select: none; }
+  .chevron { transition: transform 0.15s ease; display: inline-block; color: var(--muted); }
+  .chevron.open { transform: rotate(90deg); }
+  .cat-txns { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .cat-txn-row { display: flex; justify-content: space-between; padding: 5px 0; font-size: 0.9rem; }
+  .cat-txn-row .muted { font-size: 0.78rem; }
+  .fab {
+    position: fixed; right: 16px; bottom: calc(70px + env(safe-area-inset-bottom, 0px));
+    width: 52px; height: 52px; border-radius: 50%; font-size: 1.6rem;
+    display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: flex; align-items: flex-end; justify-content: center; z-index: 50;
+  }
+  .modal {
+    background: var(--card); border-radius: 16px 16px 0 0; padding: 20px 16px calc(20px + env(safe-area-inset-bottom, 0px));
+    width: 100%; max-width: 480px;
+  }
 </style>
 </head>
 <body>
@@ -107,7 +126,12 @@
       </div>
       <div id="summary-total" class="card center"></div>
       <h2>Categories</h2>
+      <p class="muted" style="margin-top:-6px">Tap a category to see its transactions</p>
       <div id="category-list"></div>
+      <div id="savings-section" class="hidden">
+        <h2>Savings</h2>
+        <div id="savings-list"></div>
+      </div>
     </div>
 
     <!-- TRANSACTIONS TAB -->
@@ -123,7 +147,12 @@
       <div class="card">
         <input id="new-cat-name" placeholder="Category name (e.g. Groceries)" />
         <input id="new-cat-amount" type="number" placeholder="Monthly budget amount" />
-        <button style="width:100%" onclick="addCategory()">Add category</button>
+        <select id="new-cat-type">
+          <option value="spending">Spending (counts against budget)</option>
+          <option value="savings">Savings (tracked, not counted as spending)</option>
+          <option value="transfer">Transfer between our own accounts (ignored entirely)</option>
+        </select>
+        <button style="width:100%;margin-top:10px" onclick="addCategory()">Add category</button>
       </div>
 
       <h2>Linked accounts</h2>
@@ -139,12 +168,31 @@
     <button id="tab-btn-transactions" onclick="switchTab('transactions')">Transactions</button>
     <button id="tab-btn-settings" onclick="switchTab('settings')">Settings</button>
   </div>
+
+  <!-- Floating "add cash transaction" button -->
+  <button id="fab-add-cash" class="fab hidden" onclick="openCashModal()">+</button>
+
+  <!-- Add cash transaction modal -->
+  <div id="cash-modal-backdrop" class="modal-backdrop hidden" onclick="if(event.target===this) closeCashModal()">
+    <div class="modal">
+      <h2 style="margin-top:0">Add cash transaction</h2>
+      <input id="cash-name" placeholder="What was it? (e.g. Farmers market)" />
+      <input id="cash-amount" type="number" step="0.01" placeholder="Amount" />
+      <input id="cash-date" type="date" />
+      <select id="cash-category"></select>
+      <div class="row" style="margin-top:10px">
+        <button class="secondary" style="width:48%" onclick="closeCashModal()">Cancel</button>
+        <button style="width:48%" onclick="submitCashTransaction()">Add</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
 const API = window.BUDGET_API_URL;
 let token = localStorage.getItem("budget_token") || null;
 let categories = [];
+let openCategoryIds = new Set();
 
 function authHeaders() {
   return { "Content-Type": "application/json", "Authorization": "Bearer " + token };
@@ -183,15 +231,18 @@ function logout() {
   document.getElementById("screen-login").classList.remove("hidden");
   document.getElementById("screen-main").classList.add("hidden");
   document.getElementById("tabbar").classList.add("hidden");
+  document.getElementById("fab-add-cash").classList.add("hidden");
 }
 
 function showMain() {
   document.getElementById("screen-login").classList.add("hidden");
   document.getElementById("screen-main").classList.remove("hidden");
   document.getElementById("tabbar").classList.remove("hidden");
+  document.getElementById("fab-add-cash").classList.remove("hidden");
   const monthPicker = document.getElementById("month-picker");
   monthPicker.value = new Date().toISOString().slice(0, 7);
   monthPicker.onchange = () => { loadSummary(); loadTransactions(); };
+  document.getElementById("cash-date").value = new Date().toISOString().slice(0, 10);
   loadCategories();
   loadSummary();
   loadTransactions();
@@ -218,6 +269,28 @@ async function loadCategories() {
   categories = data.categories || [];
 }
 
+function toggleCategory(categoryId) {
+  if (openCategoryIds.has(categoryId)) openCategoryIds.delete(categoryId);
+  else openCategoryIds.add(categoryId);
+  loadSummary();
+}
+
+function renderCategoryTxns(txns) {
+  if (!txns.length) return `<div class="muted" style="padding-top:4px">No transactions yet.</div>`;
+  return txns
+    .map(
+      (t) => `
+    <div class="cat-txn-row">
+      <div>
+        <div>${t.name}${t.manual ? " 💵" : ""}</div>
+        <div class="muted">${t.date}${t.pending ? " · pending" : ""}</div>
+      </div>
+      <div>${fmt(t.amount)}</div>
+    </div>`
+    )
+    .join("");
+}
+
 async function loadSummary() {
   const data = await api("/summary?month=" + currentMonth());
   const totalDiv = document.getElementById("summary-total");
@@ -226,24 +299,56 @@ async function loadSummary() {
     <div class="muted">Total spent this month</div>
     <div style="font-size:1.8rem;font-weight:700">${fmt(data.totalActual)} <span class="muted" style="font-size:1rem">of ${fmt(data.totalAnticipated)}</span></div>
     <div class="muted">${remaining >= 0 ? fmt(remaining) + " remaining" : fmt(-remaining) + " over budget"}</div>
+    ${data.totalSavings > 0 ? `<div class="muted" style="margin-top:6px">+${fmt(data.totalSavings)} saved this month</div>` : ""}
   `;
 
   const list = document.getElementById("category-list");
   list.innerHTML = "";
   data.categories
+    .filter((c) => (c.type || "spending") === "spending")
     .filter((c) => c.anticipatedAmount > 0 || c.actualAmount > 0)
     .sort((a, b) => b.actualAmount - a.actualAmount)
     .forEach((c) => {
       const pct = c.anticipatedAmount > 0 ? Math.min(100, (c.actualAmount / c.anticipatedAmount) * 100) : 100;
       const over = c.anticipatedAmount > 0 && c.actualAmount > c.anticipatedAmount;
+      const isOpen = openCategoryIds.has(c.categoryId);
       const div = document.createElement("div");
       div.className = "card";
       div.innerHTML = `
-        <div class="row"><strong>${c.name}</strong><span>${fmt(c.actualAmount)} / ${fmt(c.anticipatedAmount)}</span></div>
+        <div class="row cat-header" onclick="toggleCategory('${c.categoryId}')">
+          <div class="row" style="gap:6px"><span class="chevron ${isOpen ? "open" : ""}">▸</span><strong>${c.name}</strong></div>
+          <span>${fmt(c.actualAmount)} / ${fmt(c.anticipatedAmount)}</span>
+        </div>
         <div class="progress-track"><div class="progress-fill ${over ? "over" : ""}" style="width:${pct}%"></div></div>
+        ${isOpen ? `<div class="cat-txns">${renderCategoryTxns(c.transactions)}</div>` : ""}
       `;
       list.appendChild(div);
     });
+
+  const savingsCats = data.categories.filter((c) => c.type === "savings");
+  const savingsSection = document.getElementById("savings-section");
+  const savingsList = document.getElementById("savings-list");
+  savingsList.innerHTML = "";
+  if (savingsCats.length) {
+    savingsSection.classList.remove("hidden");
+    savingsCats.forEach((c) => {
+      const pct = c.anticipatedAmount > 0 ? Math.min(100, (c.actualAmount / c.anticipatedAmount) * 100) : 100;
+      const isOpen = openCategoryIds.has(c.categoryId);
+      const div = document.createElement("div");
+      div.className = "card";
+      div.innerHTML = `
+        <div class="row cat-header" onclick="toggleCategory('${c.categoryId}')">
+          <div class="row" style="gap:6px"><span class="chevron ${isOpen ? "open" : ""}">▸</span><strong>${c.name}</strong></div>
+          <span>${fmt(c.actualAmount)}${c.anticipatedAmount ? " / " + fmt(c.anticipatedAmount) + " goal" : ""}</span>
+        </div>
+        ${c.anticipatedAmount ? `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>` : ""}
+        ${isOpen ? `<div class="cat-txns">${renderCategoryTxns(c.transactions)}</div>` : ""}
+      `;
+      savingsList.appendChild(div);
+    });
+  } else {
+    savingsSection.classList.add("hidden");
+  }
 }
 
 async function loadTransactions() {
@@ -263,7 +368,7 @@ async function loadTransactions() {
     div.innerHTML = `
       <div class="row">
         <div>
-          <div>${t.name}</div>
+          <div>${t.name}${t.manual ? " 💵" : ""}</div>
           <div class="muted">${t.date} · ${t.institutionName || ""}${t.pending ? " · pending" : ""}</div>
         </div>
         <strong>${t.amount < 0 ? "+" : ""}${fmt(Math.abs(t.amount))}</strong>
@@ -272,6 +377,7 @@ async function loadTransactions() {
         <option value="">Uncategorized</option>
         ${options}
       </select>
+      ${t.manual ? `<button class="danger" style="width:100%;margin-top:8px" onclick="deleteManualTxn('${t.transactionId}')">Delete</button>` : ""}
     `;
     list.appendChild(div);
   });
@@ -285,16 +391,29 @@ async function categorize(transactionId, categoryId) {
   loadSummary();
 }
 
+async function deleteManualTxn(transactionId) {
+  if (!confirm("Delete this cash transaction?")) return;
+  await api("/transactions/manual/" + transactionId, { method: "DELETE" });
+  loadTransactions();
+  loadSummary();
+}
+
 function renderCategoryEditor() {
   const div = document.getElementById("category-editor");
   div.innerHTML = "";
   categories.forEach((c) => {
     const row = document.createElement("div");
     row.className = "card";
+    const type = c.type || "spending";
     row.innerHTML = `
       <input value="${c.name}" onchange="updateCategory('${c.categoryId}', 'name', this.value)" />
       <input type="number" value="${c.anticipatedAmount}" onchange="updateCategory('${c.categoryId}', 'anticipatedAmount', this.value)" />
-      <button class="danger" style="width:100%" onclick="deleteCategory('${c.categoryId}')">Delete category</button>
+      <select onchange="updateCategory('${c.categoryId}', 'type', this.value)">
+        <option value="spending" ${type === "spending" ? "selected" : ""}>Spending (counts against budget)</option>
+        <option value="savings" ${type === "savings" ? "selected" : ""}>Savings (tracked, not counted as spending)</option>
+        <option value="transfer" ${type === "transfer" ? "selected" : ""}>Transfer between our own accounts (ignored entirely)</option>
+      </select>
+      <button class="danger" style="width:100%;margin-top:10px" onclick="deleteCategory('${c.categoryId}')">Delete category</button>
     `;
     div.appendChild(row);
   });
@@ -319,8 +438,9 @@ async function deleteCategory(categoryId) {
 async function addCategory() {
   const name = document.getElementById("new-cat-name").value.trim();
   const anticipatedAmount = Number(document.getElementById("new-cat-amount").value) || 0;
+  const type = document.getElementById("new-cat-type").value;
   if (!name) return;
-  await api("/categories", { method: "POST", body: JSON.stringify({ name, anticipatedAmount, merchantRules: [] }) });
+  await api("/categories", { method: "POST", body: JSON.stringify({ name, anticipatedAmount, type, merchantRules: [] }) });
   document.getElementById("new-cat-name").value = "";
   document.getElementById("new-cat-amount").value = "";
   await loadCategories();
@@ -349,10 +469,46 @@ async function openPlaidLink() {
   handler.open();
 }
 
+// ---- Manual cash transaction modal ----
+function openCashModal() {
+  const select = document.getElementById("cash-category");
+  select.innerHTML =
+    `<option value="">Uncategorized</option>` +
+    categories
+      .filter((c) => (c.type || "spending") !== "transfer")
+      .map((c) => `<option value="${c.categoryId}">${c.name}</option>`)
+      .join("");
+  document.getElementById("cash-name").value = "";
+  document.getElementById("cash-amount").value = "";
+  document.getElementById("cash-date").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("cash-modal-backdrop").classList.remove("hidden");
+}
+
+function closeCashModal() {
+  document.getElementById("cash-modal-backdrop").classList.add("hidden");
+}
+
+async function submitCashTransaction() {
+  const name = document.getElementById("cash-name").value.trim();
+  const amount = Number(document.getElementById("cash-amount").value);
+  const date = document.getElementById("cash-date").value;
+  const categoryId = document.getElementById("cash-category").value || null;
+  if (!name || !amount || amount <= 0 || !date) {
+    alert("Please enter a description, a positive amount, and a date.");
+    return;
+  }
+  await api("/transactions/manual", {
+    method: "POST",
+    body: JSON.stringify({ name, amount, date, categoryId }),
+  });
+  closeCashModal();
+  loadSummary();
+  loadTransactions();
+}
+
 // Auto-login if a token is already saved
 if (token) showMain();
 
-// Register service worker for installability
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
 </body>
