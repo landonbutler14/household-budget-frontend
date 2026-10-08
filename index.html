@@ -125,12 +125,17 @@
         <button class="secondary" onclick="syncNow()">Refresh</button>
       </div>
       <div id="summary-total" class="card center"></div>
+      <div id="deposit-nudge" class="card muted hidden"></div>
       <h2>Categories</h2>
       <p class="muted" style="margin-top:-6px">Tap a category to see its transactions</p>
       <div id="category-list"></div>
       <div id="savings-section" class="hidden">
         <h2>Savings</h2>
         <div id="savings-list"></div>
+      </div>
+      <div id="income-section" class="hidden">
+        <h2>Income</h2>
+        <div id="income-list"></div>
       </div>
     </div>
 
@@ -150,6 +155,7 @@
         <select id="new-cat-type">
           <option value="spending">Spending (counts against budget)</option>
           <option value="savings">Savings (tracked, not counted as spending)</option>
+          <option value="income">Income (paychecks, deposits, tracked separately)</option>
           <option value="transfer">Transfer between our own accounts (ignored entirely)</option>
         </select>
         <button style="width:100%;margin-top:10px" onclick="addCategory()">Add category</button>
@@ -176,6 +182,10 @@
   <div id="cash-modal-backdrop" class="modal-backdrop hidden" onclick="if(event.target===this) closeCashModal()">
     <div class="modal">
       <h2 style="margin-top:0">Add cash transaction</h2>
+      <select id="cash-kind" style="margin-bottom:10px" onchange="refreshCashCategories()">
+        <option value="spending">Cash I spent</option>
+        <option value="income">Cash I received (income)</option>
+      </select>
       <input id="cash-name" placeholder="What was it? (e.g. Farmers market)" />
       <input id="cash-amount" type="number" step="0.01" placeholder="Amount" />
       <input id="cash-date" type="date" />
@@ -275,6 +285,10 @@ function toggleCategory(categoryId) {
   loadSummary();
 }
 
+function fmtTxn(n) {
+  return n < 0 ? "+" + fmt(-n) : fmt(n);
+}
+
 function renderCategoryTxns(txns) {
   if (!txns.length) return `<div class="muted" style="padding-top:4px">No transactions yet.</div>`;
   return txns
@@ -283,33 +297,77 @@ function renderCategoryTxns(txns) {
     <div class="cat-txn-row">
       <div>
         <div>${t.name}${t.manual ? " 💵" : ""}</div>
-        <div class="muted">${t.date}${t.pending ? " · pending" : ""}</div>
+        <div class="muted">${t.date}${t.pending ? " · pending" : ""}${t.amount < 0 && !t.manual ? "" : ""}</div>
       </div>
-      <div>${fmt(t.amount)}</div>
+      <div style="${t.amount < 0 ? "color:var(--accent)" : ""}">${fmtTxn(t.amount)}</div>
     </div>`
     )
     .join("");
+}
+
+// Savings and Income share the same "tracked, not budgeted" card layout.
+function renderTracked(cats, sectionId, listId, targetLabel) {
+  const section = document.getElementById(sectionId);
+  const list = document.getElementById(listId);
+  list.innerHTML = "";
+  if (!cats.length) {
+    section.classList.add("hidden");
+    return;
+  }
+  section.classList.remove("hidden");
+  cats.forEach((c) => {
+    const pct = c.anticipatedAmount > 0 ? Math.max(0, Math.min(100, (c.actualAmount / c.anticipatedAmount) * 100)) : 100;
+    const isOpen = openCategoryIds.has(c.categoryId);
+    const div = document.createElement("div");
+    div.className = "card";
+    div.innerHTML = `
+      <div class="row cat-header" onclick="toggleCategory('${c.categoryId}')">
+        <div class="row" style="gap:6px"><span class="chevron ${isOpen ? "open" : ""}">▸</span><strong>${c.name}</strong></div>
+        <span>${fmt(c.actualAmount)}${c.anticipatedAmount ? " / " + fmt(c.anticipatedAmount) + " " + targetLabel : ""}</span>
+      </div>
+      ${c.anticipatedAmount ? `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>` : ""}
+      ${isOpen ? `<div class="cat-txns">${renderCategoryTxns(c.transactions)}</div>` : ""}
+    `;
+    list.appendChild(div);
+  });
 }
 
 async function loadSummary() {
   const data = await api("/summary?month=" + currentMonth());
   const totalDiv = document.getElementById("summary-total");
   const remaining = data.totalAnticipated - data.totalActual;
+  const showIncome = data.totalIncome !== 0 || data.totalExpectedIncome > 0;
+  const net = data.totalIncome - data.totalActual;
   totalDiv.innerHTML = `
     <div class="muted">Total spent this month</div>
     <div style="font-size:1.8rem;font-weight:700">${fmt(data.totalActual)} <span class="muted" style="font-size:1rem">of ${fmt(data.totalAnticipated)}</span></div>
     <div class="muted">${remaining >= 0 ? fmt(remaining) + " remaining" : fmt(-remaining) + " over budget"}</div>
     ${data.totalSavings > 0 ? `<div class="muted" style="margin-top:6px">+${fmt(data.totalSavings)} saved this month</div>` : ""}
+    ${showIncome ? `
+      <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);text-align:left">
+        <div><div class="muted">Income</div><strong>${fmt(data.totalIncome)}</strong></div>
+        <div style="text-align:right"><div class="muted">Net (income − spending)</div>
+          <strong style="color:${net >= 0 ? "var(--accent)" : "var(--danger)"}">${net >= 0 ? "+" : "-"}${fmt(Math.abs(net))}</strong></div>
+      </div>` : ""}
   `;
+
+  const nudge = document.getElementById("deposit-nudge");
+  const dep = data.uncategorizedDeposits || { count: 0, amount: 0 };
+  if (dep.count > 0) {
+    nudge.classList.remove("hidden");
+    nudge.textContent = `${dep.count} incoming deposit${dep.count === 1 ? "" : "s"} (${fmt(dep.amount)}) not categorized yet. Open the Transactions tab and mark each as Income, a refund category, or a Transfer.`;
+  } else {
+    nudge.classList.add("hidden");
+  }
 
   const list = document.getElementById("category-list");
   list.innerHTML = "";
   data.categories
     .filter((c) => (c.type || "spending") === "spending")
-    .filter((c) => c.anticipatedAmount > 0 || c.actualAmount > 0)
+    .filter((c) => c.anticipatedAmount > 0 || c.actualAmount !== 0)
     .sort((a, b) => b.actualAmount - a.actualAmount)
     .forEach((c) => {
-      const pct = c.anticipatedAmount > 0 ? Math.min(100, (c.actualAmount / c.anticipatedAmount) * 100) : 100;
+      const pct = c.anticipatedAmount > 0 ? Math.max(0, Math.min(100, (c.actualAmount / c.anticipatedAmount) * 100)) : 100;
       const over = c.anticipatedAmount > 0 && c.actualAmount > c.anticipatedAmount;
       const isOpen = openCategoryIds.has(c.categoryId);
       const div = document.createElement("div");
@@ -325,30 +383,8 @@ async function loadSummary() {
       list.appendChild(div);
     });
 
-  const savingsCats = data.categories.filter((c) => c.type === "savings");
-  const savingsSection = document.getElementById("savings-section");
-  const savingsList = document.getElementById("savings-list");
-  savingsList.innerHTML = "";
-  if (savingsCats.length) {
-    savingsSection.classList.remove("hidden");
-    savingsCats.forEach((c) => {
-      const pct = c.anticipatedAmount > 0 ? Math.min(100, (c.actualAmount / c.anticipatedAmount) * 100) : 100;
-      const isOpen = openCategoryIds.has(c.categoryId);
-      const div = document.createElement("div");
-      div.className = "card";
-      div.innerHTML = `
-        <div class="row cat-header" onclick="toggleCategory('${c.categoryId}')">
-          <div class="row" style="gap:6px"><span class="chevron ${isOpen ? "open" : ""}">▸</span><strong>${c.name}</strong></div>
-          <span>${fmt(c.actualAmount)}${c.anticipatedAmount ? " / " + fmt(c.anticipatedAmount) + " goal" : ""}</span>
-        </div>
-        ${c.anticipatedAmount ? `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>` : ""}
-        ${isOpen ? `<div class="cat-txns">${renderCategoryTxns(c.transactions)}</div>` : ""}
-      `;
-      savingsList.appendChild(div);
-    });
-  } else {
-    savingsSection.classList.add("hidden");
-  }
+  renderTracked(data.categories.filter((c) => c.type === "savings"), "savings-section", "savings-list", "goal");
+  renderTracked(data.categories.filter((c) => c.type === "income"), "income-section", "income-list", "expected");
 }
 
 async function loadTransactions() {
@@ -411,6 +447,7 @@ function renderCategoryEditor() {
       <select onchange="updateCategory('${c.categoryId}', 'type', this.value)">
         <option value="spending" ${type === "spending" ? "selected" : ""}>Spending (counts against budget)</option>
         <option value="savings" ${type === "savings" ? "selected" : ""}>Savings (tracked, not counted as spending)</option>
+        <option value="income" ${type === "income" ? "selected" : ""}>Income (paychecks, deposits, tracked separately)</option>
         <option value="transfer" ${type === "transfer" ? "selected" : ""}>Transfer between our own accounts (ignored entirely)</option>
       </select>
       <button class="danger" style="width:100%;margin-top:10px" onclick="deleteCategory('${c.categoryId}')">Delete category</button>
@@ -470,14 +507,20 @@ async function openPlaidLink() {
 }
 
 // ---- Manual cash transaction modal ----
-function openCashModal() {
-  const select = document.getElementById("cash-category");
-  select.innerHTML =
+function refreshCashCategories() {
+  const kind = document.getElementById("cash-kind").value;
+  const allowed = kind === "income" ? ["income"] : ["spending", "savings"];
+  document.getElementById("cash-category").innerHTML =
     `<option value="">Uncategorized</option>` +
     categories
-      .filter((c) => (c.type || "spending") !== "transfer")
+      .filter((c) => allowed.includes(c.type || "spending"))
       .map((c) => `<option value="${c.categoryId}">${c.name}</option>`)
       .join("");
+}
+
+function openCashModal() {
+  document.getElementById("cash-kind").value = "spending";
+  refreshCashCategories();
   document.getElementById("cash-name").value = "";
   document.getElementById("cash-amount").value = "";
   document.getElementById("cash-date").value = new Date().toISOString().slice(0, 10);
@@ -493,13 +536,14 @@ async function submitCashTransaction() {
   const amount = Number(document.getElementById("cash-amount").value);
   const date = document.getElementById("cash-date").value;
   const categoryId = document.getElementById("cash-category").value || null;
+  const isIncome = document.getElementById("cash-kind").value === "income";
   if (!name || !amount || amount <= 0 || !date) {
     alert("Please enter a description, a positive amount, and a date.");
     return;
   }
   await api("/transactions/manual", {
     method: "POST",
-    body: JSON.stringify({ name, amount, date, categoryId }),
+    body: JSON.stringify({ name, amount, date, categoryId, isIncome }),
   });
   closeCashModal();
   loadSummary();
